@@ -1,0 +1,220 @@
+---
+title: "hack"
+author: "Zachary Brunell"
+date: "`r Sys.Date()`"
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r echo =FALSE, results= "hide", message=FALSE}
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(RColorBrewer)
+```
+# Graphing
+```{r echo =FALSE, results= TRUE, fig.width=16, fig.height=12}
+production <- read.csv("Production_history_production_wells.csv", check.names  = TRUE)
+# Ensure data type
+production$Date <- ymd_hms(production$Date)
+production$`Cumulative.Oil.Production..BBL` <- as.numeric(production$`Cumulative.Oil.Production..BBL`)
+
+# ---- TRUE monthly rate: (month-end cumulative) - (prev month-end cumulative)
+production <- production %>%
+  filter(Date >= ymd("2020-01-01")) %>%
+  mutate(Month = as.Date(floor_date(Date, "month"))) %>%
+  arrange(Well_ID, Date) %>%
+  group_by(Well_ID, Month) %>%
+  slice_tail(n = 1) %>%
+  ungroup() %>%
+  arrange(Well_ID, Month) %>%
+  group_by(Well_ID) %>%
+  mutate(Production_Rate = `Cumulative.Oil.Production..BBL` - lag(`Cumulative.Oil.Production..BBL`)) %>%
+  ungroup()
+
+y_upper <- quantile(production$Production_Rate, 1, na.rm = TRUE)
+y_lower <- quantile(production$Production_Rate, 0.01, na.rm = TRUE)
+
+# Split wells into chunks of 12
+wells <- sort(unique(production$Well_ID))
+well_chunks <- split(wells, ceiling(seq_along(wells) / 12))
+
+groups_to_print <- c(2, 6)
+
+# Global mean line by Month (must match x-axis!)
+global_mean_line <- production %>%
+  group_by(Month) %>%
+  summarise(Global_Mean_Rate = mean(Production_Rate, na.rm = TRUE), .groups = "drop")
+
+for (i in groups_to_print) {
+
+  chunk_wells <- well_chunks[[i]]
+  plot_data <- production %>% filter(Well_ID %in% chunk_wells)
+
+p <- ggplot(plot_data, aes(x = Month, y = Production_Rate, color = factor(Well_ID))) +
+  geom_line(linewidth = 0.9, alpha = 0.85, na.rm = TRUE) +
+  geom_line(
+    data = global_mean_line,
+    aes(x = Month, y = Global_Mean_Rate),
+    inherit.aes = FALSE,
+    linewidth = 1.4,
+    color = "black",
+    na.rm = TRUE
+  ) +
+  coord_cartesian(ylim = c(y_lower, y_upper)) +
+  scale_color_brewer(palette = "Paired") +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+  labs(
+    title = paste("Monthly Oil Production Rate by Well (Group", i, ")"),
+    subtitle = "Black line = mean across wells in group",
+    x = "Month",
+    y = "Monthly Production Rate (BBL)",
+    color = "Well ID"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.title.x = element_text(size = 18, face = "bold"),
+    axis.title.y = element_text(size = 18, face = "bold"),
+    axis.text.x  = element_text(size = 14, angle = 45, hjust = 1),
+    axis.text.y  = element_text(size = 14),
+    legend.position = "bottom",
+    legend.title = element_text(size = 16, face = "bold"),
+    legend.text  = element_text(size = 14),
+    plot.title = element_text(size = 20, face = "bold"),
+    plot.subtitle = element_text(size = 14)
+  )
+  print(p)
+}
+```
+
+# Filtering
+```{r echo=TRUE, results="hide", warning=FALSE}
+library(dplyr)
+
+# Make sure data is sorted
+production_sorted <- production %>%
+  arrange(Well_ID, Date) %>%
+  group_by(Well_ID) %>%
+  mutate(row_number = row_number()) %>%
+  ungroup()
+
+# Find first nonzero production per well
+first_nonzero <- production_sorted %>%
+  group_by(Well_ID) %>%
+  filter(Cumulative.Oil.Production..BBL > 0) %>%
+  slice_head(n = 1) %>%
+  select(Well_ID, row_number) %>%
+  rename(first_nonzero_row = row_number)
+
+# Join back and get row 48 months after first nonzero to ensure no bias
+production_48_after_first_nonzero <- production_sorted %>%
+  left_join(first_nonzero, by = "Well_ID") %>%
+  filter(!is.na(first_nonzero_row) & row_number == first_nonzero_row + 48) %>%
+  select(Well_ID, Date, Cumulative.Oil.Production..BBL) %>%
+  rename(Cumulative_48_Months_After_First_Nonzero = Cumulative.Oil.Production..BBL)
+
+top_10 = production_48_after_first_nonzero %>%
+  arrange(desc(Cumulative_48_Months_After_First_Nonzero)) %>%
+  slice_head(n = 10)
+bottom_10 = production_48_after_first_nonzero %>%
+  arrange((Cumulative_48_Months_After_First_Nonzero)) %>%
+  slice_head(n = 10)
+post = read.csv("output.csv") # File after imputation
+
+post_10 = post %>%
+  # Filter wells in top or bottom
+  filter(Well_ID %in% top_10$Well_ID | Well_ID %in% bottom_10$Well_ID) %>%
+  # Create a single category column
+  mutate(Category = case_when(
+    Well_ID %in% top_10$Well_ID ~ "Top",
+    Well_ID %in% bottom_10$Well_ID ~ "Bottom"
+  )) %>%
+  # Group by Well_ID and Category
+  group_by(Well_ID, Category) %>%
+  # Calculate median for all numeric columns
+  summarise(across(where(is.numeric), median, na.rm = TRUE), .groups = "drop")%>%
+  mutate(across(where(is.numeric), ~round(.x, 2))) %>%
+  select(-X.1)
+post_10
+# View the result
+write.csv(post_10, "top10bottom10.csv")
+```
+
+# Choose predictors
+# SMD Table
+```{r echo = 'FALSE', warning=FALSE}
+num_cols = names(post_10)[sapply(post_10, is.numeric)]
+exclude = c("Well_ID")
+predictors = setdiff(num_cols, exclude)
+
+summ_list <- list()
+
+for (p in predictors) {
+
+  # numeric vectors for the predictor p, split by Category
+  x_top <- post_10 %>% filter(Category == "Top") %>% pull(!!p)
+  x_bot <- post_10 %>% filter(Category == "Bottom") %>% pull(!!p)
+
+  x_top <- as.numeric(x_top)
+  x_bot <- as.numeric(x_bot)
+
+  x_top <- x_top[!is.na(x_top)]
+  x_bot <- x_bot[!is.na(x_bot)]
+
+  m_top <- median(x_top)
+  m_bot <- median(x_bot)
+
+  summ_list[[length(summ_list) + 1]] <- data.frame(
+    predictor = p,
+    average_top = m_top,
+    average_bottom = m_bot,
+    diff = m_top - m_bot
+  )
+}
+
+summary_df <- do.call(rbind, summ_list)
+summary_df
+
+```
+# Heatmap
+```{r echo = FALSE, warning=FALSE}
+heat_data <- post_10 %>%
+  select(where(is.numeric)) %>%
+  select(-Well_ID)
+
+# scale features
+heat_scaled <- scale(heat_data)
+
+row_order <- order(post_10$Category)
+heat_scaled <- heat_scaled[row_order, ]
+
+row_labels <- post_10$Category[row_order]
+heatmap(
+  heat_scaled,
+  Rowv = NA,
+  Colv = NA,
+  scale = "none",
+  labRow = row_labels,
+  margins = c(6, 8),
+  col = colorRampPalette(c("red", "white", "blue"))(100)
+)
+
+library(corrplot)
+
+X <- post_10 %>%
+  select(all_of(setdiff(predictors, "Z"))) %>%
+  scale()   # correlation assumes standardized scale
+
+cor_mat <- cor(X, use = "pairwise.complete.obs")
+
+corrplot(
+  cor_mat,
+  method = "color",
+  type = "upper",
+  tl.cex = 0.7,
+  tl.col = "black"
+)
+
+```
